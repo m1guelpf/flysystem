@@ -1,11 +1,11 @@
 [package]
 license = "MIT"
 edition = "2021"
-version = "0.1.0"
+version = "0.1.1"
 name = "flysystem"
 readme = "README.md"
 categories = ["filesystem", "asynchronous"]
-author = ["Miguel Piedrafita <rust@miguel.build>"]
+authors = ["Miguel Piedrafita <rust@miguel.build>"]
 repository = "https://github.com/m1guelpf/flysystem"
 description = "A filesystem abstraction layer for Rust."
 keywords = ["filesystem", "asynchronous", "storage", "storage-abstraction"]

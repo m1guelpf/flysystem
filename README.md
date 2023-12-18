@@ -19,7 +19,7 @@ use flysystem::{Filesystem, adapters::{S3Adapter, s3::Config}};
 
 // instantly swap between storage backends (like S3/Local/FTP)
 // by changing the type here 👇👇👇
-let filesystem = Filesystem::<S3Adapter>::new(Config {
+let mut filesystem = Filesystem::<S3Adapter>::new(Config {
     region: env::var("S3_REGION").ok(),
     bucket: env::var("S3_BUCKET").unwrap(),
     endpoint: env::var("S3_ENDPOINT").unwrap(),
@@ -27,7 +27,7 @@ let filesystem = Filesystem::<S3Adapter>::new(Config {
     secret_key: env::var("S3_SECRET_KEY").unwrap(),
 }).await?;
 
-filesystem.write("my-first-file.txt", "Hello, world!").await?;
+filesystem.write(Path::new("my-first-file.txt"), "Hello, world!").await?;
 ```
 
 Refer to the [documentation on docs.rs](https://docs.rs/flysystem) for detailed usage instructions.

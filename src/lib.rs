@@ -1,5 +1,34 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+//! ## About Flysystem
+//!
+//! Flysystem is a file storage library for Rust. It provides one interface to interact with many types of filesystems.
+//! When you use Flysystem, you're not only protected from vendor lock-in, you'll also have a consistent experience for which ever storage is right for you.
+//!
+//! It's inspired by the [PHP library of the same name](https://flysystem.thephpleague.com/docs/).
+//!
+//! ## Getting Started
+//!
+//! ```rust
+//! use flysystem::{Filesystem, adapters::{S3Adapter, s3::Config}};
+//! # use std::{env, path::Path};
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! // instantly swap between storage backends (like S3/Local/FTP)
+//! // by changing the type here 👇👇👇
+//! let mut filesystem = Filesystem::<S3Adapter>::new(Config {
+//!     region: env::var("S3_REGION").ok(),
+//!     bucket: env::var("S3_BUCKET").unwrap(),
+//!     endpoint: env::var("S3_ENDPOINT").unwrap(),
+//!     access_key: env::var("S3_ACCESS_KEY").unwrap(),
+//!     secret_key: env::var("S3_SECRET_KEY").unwrap(),
+//! }).await?;
+//!
+//! filesystem.write(Path::new("my-first-file.txt"), "Hello, world!").await?;
+//! # Ok(())
+//! # }
+//! ```
+
 use adapters::{Adapter, PublicUrlGenerator, TemporaryUrlGenerator};
 use contents::Contents;
 use mime::Mime;
