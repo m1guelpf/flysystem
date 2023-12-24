@@ -1,5 +1,7 @@
 use mime::Mime;
 use std::{
+	error::Error,
+	fmt::Debug,
 	future::Future,
 	path::{Path, PathBuf},
 	time::{Duration, SystemTime},
@@ -22,7 +24,7 @@ use crate::{contents::Contents, Visibility};
 /// A storage adapter.
 pub trait Adapter: Sized + Send + Sync {
 	/// The error type returned by the adapter.
-	type Error: Send;
+	type Error: Debug + Error + Send;
 
 	/// The configuration this adapter requires.
 	type Config: Send;
