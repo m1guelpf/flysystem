@@ -53,6 +53,7 @@ enum Resource {
 	Directory,
 }
 
+#[derive(Debug, Clone)]
 /// Abstraction over a filesystem.
 pub struct Filesystem<T: Adapter> {
 	adapter: T,

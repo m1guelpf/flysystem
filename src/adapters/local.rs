@@ -9,17 +9,16 @@ use std::{
 };
 use tokio::fs;
 
+use super::Adapter;
 use crate::{contents::Contents, Resource, Visibility};
 
-use super::Adapter;
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
 	pub location: PathBuf,
 	pub lazy_root_creation: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(clippy::module_name_repetitions)]
 pub struct LocalAdapter {
 	location: PathBuf,

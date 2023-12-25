@@ -24,7 +24,7 @@ impl File {
 	}
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(clippy::module_name_repetitions)]
 pub struct MemoryAdapter {
 	files: HashMap<PathBuf, File>,

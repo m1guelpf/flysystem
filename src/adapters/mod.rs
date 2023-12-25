@@ -22,12 +22,12 @@ pub use s3::S3Adapter;
 use crate::{contents::Contents, Visibility};
 
 /// A storage adapter.
-pub trait Adapter: Sized + Send + Sync {
+pub trait Adapter: Clone + Sized + Send + Sync {
 	/// The error type returned by the adapter.
-	type Error: Debug + Error + Send;
+	type Error: Debug + Error + Send + Sized;
 
 	/// The configuration this adapter requires.
-	type Config: Send;
+	type Config: Clone + Send + Sized;
 
 	/// Create a new adapter instance.
 	fn new(config: Self::Config) -> impl Future<Output = Result<Self, Self::Error>> + Send;

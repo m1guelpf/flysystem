@@ -18,7 +18,7 @@ use std::{
 use super::{Adapter, TemporaryUrlGenerator};
 use crate::{contents::Contents, Visibility};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
 	pub bucket: String,
 	pub endpoint: String,
@@ -27,7 +27,7 @@ pub struct Config {
 	pub region: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(clippy::module_name_repetitions)]
 pub struct S3Adapter {
 	client: Client,
