@@ -16,7 +16,7 @@
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! // instantly swap between storage backends (like S3/Local/FTP)
 //! // by changing the type here 👇👇👇
-//! let mut filesystem = Filesystem::<S3Adapter>::new(Config {
+//! let mut filesystem = Filesystem::new::<S3Adapter>(Config {
 //!     region: env::var("S3_REGION").ok(),
 //!     bucket: env::var("S3_BUCKET").unwrap(),
 //!     endpoint: env::var("S3_ENDPOINT").unwrap(),
@@ -29,16 +29,19 @@
 //! # }
 //! ```
 
-use adapters::{Adapter, PublicUrlGenerator, TemporaryUrlGenerator};
+use adapters::{Adapter, AdapterInit};
 use contents::Contents;
 use mime::Mime;
 use std::{
+	io::{Error, ErrorKind, Result},
 	path::{Path, PathBuf},
-	time::Duration,
+	time::SystemTime,
 };
+use trait_object_hackyness::AdapterObject;
 
 pub mod adapters;
 mod contents;
+mod trait_object_hackyness;
 
 /// The visibility of a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,22 +56,24 @@ enum Resource {
 	Directory,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 /// Abstraction over a filesystem.
-pub struct Filesystem<T: Adapter> {
-	adapter: T,
+pub struct Filesystem {
+	adapter: Box<dyn AdapterObject>,
 }
 
-impl<T: Adapter> Filesystem<T> {
-	/// Create a new filesystem instance.
-	///
-	/// # Errors
-	///
-	/// This function will return an error if the adapter fails to initialize.
-	pub async fn new(config: T::Config) -> Result<Self, T::Error> {
+impl Filesystem {
+	pub async fn new<T: AdapterInit>(config: T::Config) -> std::result::Result<Self, T::Error> {
 		Ok(Self {
-			adapter: T::new(config).await?,
+			adapter: Box::new(T::new(config).await?),
 		})
+	}
+
+	/// Create a new filesystem instance.
+	pub fn from_adapter<T: Adapter + 'static>(adapter: T) -> Self {
+		Self {
+			adapter: Box::new(adapter),
+		}
 	}
 
 	/// Check if a file exists.
@@ -76,7 +81,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to check if the file exists.
-	pub async fn file_exists(&self, path: &Path) -> Result<bool, T::Error> {
+	pub async fn file_exists(&self, path: &Path) -> Result<bool> {
 		self.adapter.file_exists(path).await
 	}
 
@@ -85,7 +90,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to check if the directory exists.
-	pub async fn directory_exists(&self, path: &Path) -> Result<bool, T::Error> {
+	pub async fn directory_exists(&self, path: &Path) -> Result<bool> {
 		self.adapter.directory_exists(path).await
 	}
 
@@ -94,7 +99,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to check if the file or directory exists.
-	pub async fn has(&self, path: &Path) -> Result<bool, T::Error> {
+	pub async fn has(&self, path: &Path) -> Result<bool> {
 		let (file_exists, directory_exists) = futures::future::join(
 			self.adapter.file_exists(path),
 			self.adapter.directory_exists(path),
@@ -109,11 +114,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to write the file.
-	pub async fn write<C: AsRef<[u8]> + Send>(
-		&mut self,
-		path: &Path,
-		contents: C,
-	) -> Result<(), T::Error> {
+	pub async fn write(&mut self, path: &Path, contents: &[u8]) -> Result<()> {
 		self.adapter.write(path, contents).await
 	}
 
@@ -122,8 +123,11 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to read the file.
-	pub async fn read<R: TryFrom<Contents>>(&mut self, path: &Path) -> Result<R, T::Error> {
-		self.adapter.read(path).await
+	pub async fn read<R: TryFrom<Contents>>(&mut self, path: &Path) -> Result<R> {
+		self.adapter.read(path).await.and_then(|c| {
+			c.try_into()
+				.map_err(|_| Error::new(ErrorKind::InvalidData, "Could not decode contents."))
+		})
 	}
 
 	/// Delete a file.
@@ -131,7 +135,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to delete the file or directory.
-	pub async fn delete(&mut self, path: &Path) -> Result<(), T::Error> {
+	pub async fn delete(&mut self, path: &Path) -> Result<()> {
 		self.adapter.delete(path).await
 	}
 
@@ -140,7 +144,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to delete the directory.
-	pub async fn delete_directory(&mut self, path: &Path) -> Result<(), T::Error> {
+	pub async fn delete_directory(&mut self, path: &Path) -> Result<()> {
 		self.adapter.delete_directory(path).await
 	}
 
@@ -149,7 +153,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to create the directory.
-	pub async fn create_directory(&mut self, path: &Path) -> Result<(), T::Error> {
+	pub async fn create_directory(&mut self, path: &Path) -> Result<()> {
 		self.adapter.create_directory(path).await
 	}
 
@@ -158,7 +162,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to list the contents of the directory.
-	pub async fn list_contents(&self, path: &Path, deep: bool) -> Result<Vec<PathBuf>, T::Error> {
+	pub async fn list_contents(&self, path: &Path, deep: bool) -> Result<Vec<PathBuf>> {
 		self.adapter.list_contents(path, deep).await
 	}
 
@@ -167,7 +171,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to move the file.
-	pub async fn r#move(&mut self, source: &Path, destination: &Path) -> Result<(), T::Error> {
+	pub async fn r#move(&mut self, source: &Path, destination: &Path) -> Result<()> {
 		self.adapter.r#move(source, destination).await
 	}
 
@@ -176,7 +180,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to copy the file.
-	pub async fn copy(&mut self, source: &Path, destination: &Path) -> Result<(), T::Error> {
+	pub async fn copy(&mut self, source: &Path, destination: &Path) -> Result<()> {
 		self.adapter.copy(source, destination).await
 	}
 
@@ -185,7 +189,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to get the last modified date and time.
-	pub async fn last_modified(&self, path: &Path) -> Result<std::time::SystemTime, T::Error> {
+	pub async fn last_modified(&self, path: &Path) -> Result<SystemTime> {
 		self.adapter.last_modified(path).await
 	}
 
@@ -194,7 +198,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to get the file size.
-	pub async fn file_size(&self, path: &Path) -> Result<u64, T::Error> {
+	pub async fn file_size(&self, path: &Path) -> Result<u64> {
 		self.adapter.file_size(path).await
 	}
 
@@ -203,7 +207,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to get the mime type.
-	pub async fn mime_type(&self, path: &Path) -> Result<Mime, T::Error> {
+	pub async fn mime_type(&self, path: &Path) -> Result<Mime> {
 		self.adapter.mime_type(path).await
 	}
 
@@ -212,11 +216,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to set the visibility.
-	pub async fn set_visibility(
-		&mut self,
-		path: &Path,
-		visibility: Visibility,
-	) -> Result<(), T::Error> {
+	pub async fn set_visibility(&mut self, path: &Path, visibility: Visibility) -> Result<()> {
 		self.adapter.set_visibility(path, visibility).await
 	}
 
@@ -225,7 +225,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to get the visibility.
-	pub async fn visibility(&self, path: &Path) -> Result<Visibility, T::Error> {
+	pub async fn visibility(&self, path: &Path) -> Result<Visibility> {
 		self.adapter.visibility(path).await
 	}
 
@@ -234,36 +234,7 @@ impl<T: Adapter> Filesystem<T> {
 	/// # Errors
 	///
 	/// This function will return an error if the adapter fails to get the checksum.
-	pub async fn checksum(&self, path: &Path) -> Result<String, T::Error> {
+	pub async fn checksum(&self, path: &Path) -> Result<String> {
 		self.adapter.checksum(path).await
-	}
-}
-
-impl<T: Adapter + PublicUrlGenerator> Filesystem<T> {
-	/// Get the public URL of the file.
-	///
-	/// # Errors
-	///
-	/// This function will return an error if the adapter fails to get the public URL.
-	pub async fn public_url(
-		&self,
-		path: &Path,
-	) -> Result<String, <T as PublicUrlGenerator>::Error> {
-		self.adapter.public_url(path).await
-	}
-}
-
-impl<T: Adapter + TemporaryUrlGenerator> Filesystem<T> {
-	/// Get a temporary URL of the file.
-	///
-	/// # Errors
-	///
-	/// This function will return an error if the adapter fails to get the temporary URL.
-	pub async fn temporary_url(
-		&self,
-		path: &Path,
-		expires_in: Duration,
-	) -> Result<String, <T as TemporaryUrlGenerator>::Error> {
-		self.adapter.temporary_url(path, expires_in).await
 	}
 }

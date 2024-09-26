@@ -1,12 +1,14 @@
 use std::{
 	collections::HashMap,
+	convert::Infallible,
+	io::{Error, ErrorKind, Result},
 	path::{Path, PathBuf},
 	time::SystemTime,
 };
 
 use async_recursion::async_recursion;
 
-use super::Adapter;
+use super::{Adapter, AdapterInit};
 use crate::{contents::Contents, Visibility};
 
 #[derive(Debug, Clone)]
@@ -33,11 +35,11 @@ pub struct MemoryAdapter {
 
 impl MemoryAdapter {
 	#[async_recursion]
-	async fn get_files_deep(&self, path: &Path, deep: bool) -> Result<Vec<PathBuf>, Error> {
+	async fn get_files_deep(&self, path: &Path, deep: bool) -> Result<Vec<PathBuf>> {
 		let mut contents = self
 			.directory
 			.get(path)
-			.ok_or(Error::DirectoryNotFound)?
+			.ok_or_else(|| Error::from(ErrorKind::NotFound))?
 			.clone();
 
 		if deep {
@@ -52,30 +54,28 @@ impl MemoryAdapter {
 	}
 }
 
-impl Adapter for MemoryAdapter {
+impl AdapterInit for MemoryAdapter {
 	type Config = ();
-	type Error = Error;
+	type Error = Infallible;
 
-	async fn new((): Self::Config) -> Result<Self, Self::Error> {
+	async fn new((): Self::Config) -> std::result::Result<Self, Self::Error> {
 		Ok(Self {
 			files: HashMap::new(),
 			directory: HashMap::new(),
 		})
 	}
+}
 
-	async fn file_exists(&self, path: &Path) -> Result<bool, Self::Error> {
+impl Adapter for MemoryAdapter {
+	async fn file_exists(&self, path: &Path) -> Result<bool> {
 		Ok(self.files.contains_key(path))
 	}
 
-	async fn directory_exists(&self, path: &Path) -> Result<bool, Self::Error> {
+	async fn directory_exists(&self, path: &Path) -> Result<bool> {
 		Ok(self.directory.contains_key(path))
 	}
 
-	async fn write<C: AsRef<[u8]> + Send>(
-		&mut self,
-		path: &Path,
-		content: C,
-	) -> Result<(), Self::Error> {
+	async fn write(&mut self, path: &Path, content: &[u8]) -> Result<()> {
 		self.files.insert(
 			path.to_path_buf(),
 			File {
@@ -95,17 +95,18 @@ impl Adapter for MemoryAdapter {
 		Ok(())
 	}
 
-	async fn read<T: TryFrom<Contents>>(&self, path: &Path) -> Result<T, Self::Error> {
-		let file = self.files.get(path).ok_or(Error::FileNotFound)?;
+	async fn read(&self, path: &Path) -> Result<Contents> {
+		let file = self
+			.files
+			.get(path)
+			.ok_or_else(|| Error::from(ErrorKind::NotFound))?;
 
-		Contents::from(file.content.clone())
-			.try_into()
-			.map_err(|_| Error::DecodeError)
+		Ok(Contents::from(file.content.clone()))
 	}
 
-	async fn delete(&mut self, path: &Path) -> Result<(), Self::Error> {
+	async fn delete(&mut self, path: &Path) -> Result<()> {
 		if self.files.remove(path).is_none() {
-			return Err(Error::FileNotFound);
+			return Err(Error::from(ErrorKind::NotFound));
 		}
 
 		self.directory
@@ -116,10 +117,10 @@ impl Adapter for MemoryAdapter {
 		Ok(())
 	}
 
-	async fn delete_directory(&mut self, path: &Path) -> Result<(), Self::Error> {
+	async fn delete_directory(&mut self, path: &Path) -> Result<()> {
 		self.directory
 			.remove(path)
-			.ok_or(Error::DirectoryNotFound)?;
+			.ok_or_else(|| Error::from(ErrorKind::NotFound))?;
 
 		self.files
 			.retain(|file_path, _| !file_path.starts_with(path));
@@ -127,7 +128,7 @@ impl Adapter for MemoryAdapter {
 		Ok(())
 	}
 
-	async fn create_directory(&mut self, path: &Path) -> Result<(), Self::Error> {
+	async fn create_directory(&mut self, path: &Path) -> Result<()> {
 		let mut current_path = PathBuf::new();
 		for component in path.components() {
 			current_path.push(component);
@@ -137,13 +138,9 @@ impl Adapter for MemoryAdapter {
 		Ok(())
 	}
 
-	async fn set_visibility(
-		&mut self,
-		path: &Path,
-		visibility: Visibility,
-	) -> Result<(), Self::Error> {
+	async fn set_visibility(&mut self, path: &Path, visibility: Visibility) -> Result<()> {
 		let Some(file) = self.files.get_mut(path) else {
-			return Err(Error::FileNotFound);
+			return Err(Error::from(ErrorKind::NotFound));
 		};
 
 		file.visibility = visibility;
@@ -151,40 +148,52 @@ impl Adapter for MemoryAdapter {
 		Ok(())
 	}
 
-	async fn visibility(&self, path: &Path) -> Result<Visibility, Self::Error> {
-		let file = self.files.get(path).ok_or(Error::FileNotFound)?;
+	async fn visibility(&self, path: &Path) -> Result<Visibility> {
+		let file = self
+			.files
+			.get(path)
+			.ok_or_else(|| Error::from(ErrorKind::NotFound))?;
 
 		Ok(file.visibility)
 	}
 
-	async fn mime_type(&self, path: &Path) -> Result<mime::Mime, Self::Error> {
+	async fn mime_type(&self, path: &Path) -> Result<mime::Mime> {
 		Ok(mime_guess::from_path(path).first_or_octet_stream())
 	}
 
-	async fn last_modified(&self, path: &Path) -> Result<std::time::SystemTime, Self::Error> {
-		let file = self.files.get(path).ok_or(Error::FileNotFound)?;
+	async fn last_modified(&self, path: &Path) -> Result<std::time::SystemTime> {
+		let file = self
+			.files
+			.get(path)
+			.ok_or_else(|| Error::from(ErrorKind::NotFound))?;
 
 		Ok(file.last_modified)
 	}
 
-	async fn file_size(&self, path: &Path) -> Result<u64, Self::Error> {
-		let file = self.files.get(path).ok_or(Error::FileNotFound)?;
+	async fn file_size(&self, path: &Path) -> Result<u64> {
+		let file = self
+			.files
+			.get(path)
+			.ok_or_else(|| Error::from(ErrorKind::NotFound))?;
 
 		Ok(file.content.len() as u64)
 	}
 
-	async fn list_contents(&self, path: &Path, deep: bool) -> Result<Vec<PathBuf>, Self::Error> {
+	async fn list_contents(&self, path: &Path, deep: bool) -> Result<Vec<PathBuf>> {
 		self.get_files_deep(path, deep).await
 	}
 
-	async fn r#move(&mut self, source: &Path, destination: &Path) -> Result<(), Self::Error> {
+	async fn r#move(&mut self, source: &Path, destination: &Path) -> Result<()> {
 		self.copy(source, destination).await?;
 
 		self.delete(source).await
 	}
 
-	async fn copy(&mut self, source: &Path, destination: &Path) -> Result<(), Self::Error> {
-		let file = self.files.get(source).ok_or(Error::FileNotFound)?;
+	async fn copy(&mut self, source: &Path, destination: &Path) -> Result<()> {
+		let file = self
+			.files
+			.get(source)
+			.ok_or_else(|| Error::from(ErrorKind::NotFound))?;
 
 		self.files
 			.insert(destination.to_path_buf(), file.clone().updated_now());
@@ -199,21 +208,9 @@ impl Adapter for MemoryAdapter {
 		Ok(())
 	}
 
-	async fn checksum(&self, path: &Path) -> Result<String, Self::Error> {
-		Ok(sha256::digest(self.read::<Vec<u8>>(path).await?))
+	async fn checksum(&self, path: &Path) -> Result<String> {
+		Ok(sha256::digest(self.read(path).await?.data))
 	}
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-	#[error("Directory not found")]
-	DirectoryNotFound,
-
-	#[error("File not found")]
-	FileNotFound,
-
-	#[error("Failed to decode file contents")]
-	DecodeError,
 }
 
 #[cfg(test)]
@@ -230,7 +227,7 @@ mod tests {
 			.unwrap());
 
 		client
-			.write(Path::new("test_file_exists.txt"), "Hello, world!")
+			.write(Path::new("test_file_exists.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
@@ -280,16 +277,13 @@ mod tests {
 			.unwrap());
 
 		client
-			.write(Path::new("test_write.txt"), "Hello, world!")
+			.write(Path::new("test_write.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
 		assert_eq!(
-			client
-				.read::<String>(Path::new("test_write.txt"))
-				.await
-				.unwrap(),
-			"Hello, world!"
+			client.read(Path::new("test_write.txt")).await.unwrap().data,
+			b"Hello, world!"
 		);
 
 		client.delete(Path::new("test_write.txt")).await.unwrap();
@@ -300,16 +294,13 @@ mod tests {
 		let mut client = MemoryAdapter::new(()).await.unwrap();
 
 		client
-			.write(Path::new("test_read.txt"), "Hello, world!")
+			.write(Path::new("test_read.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
 		assert_eq!(
-			client
-				.read::<String>(Path::new("test_read.txt"))
-				.await
-				.unwrap(),
-			"Hello, world!"
+			client.read(Path::new("test_read.txt")).await.unwrap().data,
+			b"Hello, world!"
 		);
 
 		client.delete(Path::new("test_read.txt")).await.unwrap();
@@ -320,7 +311,7 @@ mod tests {
 		let mut client = MemoryAdapter::new(()).await.unwrap();
 
 		client
-			.write(Path::new("test_delete.txt"), "Hello, world!")
+			.write(Path::new("test_delete.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
@@ -412,7 +403,7 @@ mod tests {
 		let mut client = MemoryAdapter::new(()).await.unwrap();
 
 		client
-			.write(Path::new("test_set_visibility.txt"), "")
+			.write(Path::new("test_set_visibility.txt"), &[])
 			.await
 			.unwrap();
 
@@ -448,7 +439,7 @@ mod tests {
 		let mut client = MemoryAdapter::new(()).await.unwrap();
 
 		client
-			.write(Path::new("test_visibility.txt"), "")
+			.write(Path::new("test_visibility.txt"), &[])
 			.await
 			.unwrap();
 
@@ -484,7 +475,7 @@ mod tests {
 		let mut client = MemoryAdapter::new(()).await.unwrap();
 
 		client
-			.write(Path::new("test_mime.txt"), "Hello, world!")
+			.write(Path::new("test_mime.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
@@ -501,7 +492,7 @@ mod tests {
 		let mut client = MemoryAdapter::new(()).await.unwrap();
 
 		client
-			.write(Path::new("test_last_modified.txt"), "")
+			.write(Path::new("test_last_modified.txt"), &[])
 			.await
 			.unwrap();
 
@@ -528,7 +519,7 @@ mod tests {
 		let mut client = MemoryAdapter::new(()).await.unwrap();
 
 		client
-			.write(Path::new("test_file_size.txt"), "Hello, world!")
+			.write(Path::new("test_file_size.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
@@ -553,14 +544,14 @@ mod tests {
 		client
 			.write(
 				Path::new("test_list_contents/test_file.txt"),
-				"Hello, world!",
+				b"Hello, world!",
 			)
 			.await
 			.unwrap();
 		client
 			.write(
 				Path::new("test_list_contents/test_recursive_dir/test_file.txt"),
-				"Hello, world!",
+				b"Hello, world!",
 			)
 			.await
 			.unwrap();
@@ -594,7 +585,7 @@ mod tests {
 		let mut client = MemoryAdapter::new(()).await.unwrap();
 
 		client
-			.write(Path::new("test_move.txt"), "Hello, world!")
+			.write(Path::new("test_move.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
@@ -631,7 +622,7 @@ mod tests {
 		let mut client = MemoryAdapter::new(()).await.unwrap();
 
 		client
-			.write(Path::new("test_copy.txt"), "Hello, world!")
+			.write(Path::new("test_copy.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 		assert!(!client
@@ -668,7 +659,7 @@ mod tests {
 		let mut client = MemoryAdapter::new(()).await.unwrap();
 
 		client
-			.write(Path::new("test_checksum.txt"), "Hello, world!")
+			.write(Path::new("test_checksum.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 

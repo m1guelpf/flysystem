@@ -17,9 +17,9 @@ It's inspired by the [PHP library of the same name](https://flysystem.thephpleag
 ```rust
 use flysystem::{Filesystem, adapters::{S3Adapter, s3::Config}};
 
-// instantly swap between storage backends (like S3/Local/FTP)
-// by changing the type here 👇👇👇
-let mut filesystem = Filesystem::<S3Adapter>::new(Config {
+// instantly swap between storage backends
+// (like S3/FTP/etc) by changing the type 👇👇👇 here.
+let mut filesystem = Filesystem::new::<S3Adapter>(Config {
     region: env::var("S3_REGION").ok(),
     bucket: env::var("S3_BUCKET").unwrap(),
     endpoint: env::var("S3_ENDPOINT").unwrap(),

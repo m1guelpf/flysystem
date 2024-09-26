@@ -2,14 +2,14 @@ use async_recursion::async_recursion;
 use mime::Mime;
 use std::{
 	fs::Permissions,
-	io,
+	io::{self, Result},
 	os::unix::fs::PermissionsExt,
 	path::{Path, PathBuf},
 	time::SystemTime,
 };
 use tokio::fs;
 
-use super::Adapter;
+use super::{Adapter, AdapterInit};
 use crate::{contents::Contents, Resource, Visibility};
 
 #[derive(Debug, Clone)]
@@ -25,7 +25,7 @@ pub struct LocalAdapter {
 }
 
 impl LocalAdapter {
-	async fn create_parent_if_not_exists(&self, path: &Path) -> io::Result<()> {
+	async fn create_parent_if_not_exists(&self, path: &Path) -> Result<()> {
 		if let Some(parent) = path.parent() {
 			if !parent.exists() {
 				fs::create_dir_all(parent).await?;
@@ -36,7 +36,7 @@ impl LocalAdapter {
 	}
 
 	#[async_recursion]
-	async fn get_files_deep(path: &Path, deep: bool) -> io::Result<Vec<PathBuf>> {
+	async fn get_files_deep(path: &Path, deep: bool) -> Result<Vec<PathBuf>> {
 		let mut paths = Vec::new();
 		let mut dir = fs::read_dir(path).await?;
 
@@ -56,11 +56,11 @@ impl LocalAdapter {
 	}
 }
 
-impl Adapter for LocalAdapter {
+impl AdapterInit for LocalAdapter {
 	type Config = Config;
 	type Error = io::Error;
 
-	async fn new(config: Self::Config) -> Result<Self, Self::Error> {
+	async fn new(config: Self::Config) -> Result<Self> {
 		if !config.location.exists() {
 			if !config.lazy_root_creation {
 				return Err(io::Error::new(
@@ -79,8 +79,10 @@ impl Adapter for LocalAdapter {
 			location: config.location,
 		})
 	}
+}
 
-	async fn file_exists(&self, path: &Path) -> Result<bool, Self::Error> {
+impl Adapter for LocalAdapter {
+	async fn file_exists(&self, path: &Path) -> Result<bool> {
 		if !path.is_file() {
 			return Ok(false);
 		}
@@ -88,7 +90,7 @@ impl Adapter for LocalAdapter {
 		Ok(path.exists())
 	}
 
-	async fn directory_exists(&self, path: &Path) -> Result<bool, Self::Error> {
+	async fn directory_exists(&self, path: &Path) -> Result<bool> {
 		if !path.is_dir() {
 			return Ok(false);
 		}
@@ -96,48 +98,38 @@ impl Adapter for LocalAdapter {
 		Ok(path.exists())
 	}
 
-	async fn write<C: AsRef<[u8]> + Send>(
-		&mut self,
-		path: &Path,
-		content: C,
-	) -> Result<(), Self::Error> {
+	async fn write(&mut self, path: &Path, content: &[u8]) -> Result<()> {
 		let path = self.location.join(path);
 		self.create_parent_if_not_exists(&path).await?;
 
 		fs::write(path, content).await
 	}
 
-	async fn read<T: TryFrom<Contents>>(&self, path: &Path) -> Result<T, Self::Error> {
+	async fn read(&self, path: &Path) -> Result<Contents> {
 		let path = self.location.join(path);
 
-		Contents::from(fs::read(path).await?)
-			.try_into()
-			.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Could not decode contents."))
+		Ok(Contents::from(fs::read(path).await?))
 	}
 
-	async fn delete(&mut self, path: &Path) -> Result<(), Self::Error> {
+	async fn delete(&mut self, path: &Path) -> Result<()> {
 		let path = self.location.join(path);
 
 		fs::remove_file(path).await
 	}
 
-	async fn delete_directory(&mut self, path: &Path) -> Result<(), Self::Error> {
+	async fn delete_directory(&mut self, path: &Path) -> Result<()> {
 		let path = self.location.join(path);
 
 		fs::remove_dir_all(path).await
 	}
 
-	async fn create_directory(&mut self, path: &Path) -> Result<(), Self::Error> {
+	async fn create_directory(&mut self, path: &Path) -> Result<()> {
 		let path = self.location.join(path);
 
 		fs::create_dir_all(path).await
 	}
 
-	async fn set_visibility(
-		&mut self,
-		path: &Path,
-		visibility: Visibility,
-	) -> Result<(), Self::Error> {
+	async fn set_visibility(&mut self, path: &Path, visibility: Visibility) -> Result<()> {
 		let path = self.location.join(path);
 		let permissions = Permissions::from_mode(visibility_to_unix((&path).into(), visibility));
 
@@ -146,7 +138,7 @@ impl Adapter for LocalAdapter {
 		Ok(())
 	}
 
-	async fn visibility(&self, path: &Path) -> Result<Visibility, Self::Error> {
+	async fn visibility(&self, path: &Path) -> Result<Visibility> {
 		let path = self.location.join(path);
 
 		Ok(unix_to_visibility(
@@ -155,27 +147,27 @@ impl Adapter for LocalAdapter {
 		))
 	}
 
-	async fn mime_type(&self, path: &Path) -> Result<Mime, Self::Error> {
+	async fn mime_type(&self, path: &Path) -> Result<Mime> {
 		let path = self.location.join(path);
 
 		Ok(mime_guess::from_path(path).first_or_octet_stream())
 	}
 
-	async fn last_modified(&self, path: &Path) -> Result<SystemTime, Self::Error> {
+	async fn last_modified(&self, path: &Path) -> Result<SystemTime> {
 		let path = self.location.join(path);
 		let metadata = fs::metadata(path).await?;
 
 		metadata.modified()
 	}
 
-	async fn file_size(&self, path: &Path) -> Result<u64, Self::Error> {
+	async fn file_size(&self, path: &Path) -> Result<u64> {
 		let path = self.location.join(path);
 		let metadata = fs::metadata(path).await?;
 
 		Ok(metadata.len())
 	}
 
-	async fn list_contents(&self, path: &Path, deep: bool) -> Result<Vec<PathBuf>, Self::Error> {
+	async fn list_contents(&self, path: &Path, deep: bool) -> Result<Vec<PathBuf>> {
 		let path = self.location.join(path);
 
 		if !path.is_dir() {
@@ -188,7 +180,7 @@ impl Adapter for LocalAdapter {
 		Self::get_files_deep(&path, deep).await
 	}
 
-	async fn r#move(&mut self, source: &Path, destination: &Path) -> Result<(), Self::Error> {
+	async fn r#move(&mut self, source: &Path, destination: &Path) -> Result<()> {
 		let source = self.location.join(source);
 		let destination = self.location.join(destination);
 
@@ -197,7 +189,7 @@ impl Adapter for LocalAdapter {
 		fs::rename(source, destination).await
 	}
 
-	async fn copy(&mut self, source: &Path, destination: &Path) -> Result<(), Self::Error> {
+	async fn copy(&mut self, source: &Path, destination: &Path) -> Result<()> {
 		let source = self.location.join(source);
 		let destination = self.location.join(destination);
 
@@ -206,8 +198,8 @@ impl Adapter for LocalAdapter {
 		Ok(())
 	}
 
-	async fn checksum(&self, path: &Path) -> Result<String, Self::Error> {
-		Ok(sha256::digest(self.read::<Vec<u8>>(path).await?))
+	async fn checksum(&self, path: &Path) -> Result<String> {
+		Ok(sha256::digest(self.read(path).await?.data))
 	}
 }
 
@@ -299,7 +291,7 @@ mod tests {
 		.unwrap();
 
 		adapter
-			.write(Path::new("test_write.txt"), "Hello, world!")
+			.write(Path::new("test_write.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
@@ -323,11 +315,8 @@ mod tests {
 		std::fs::write("/tmp/flysystem_tests/test_read.txt", "Hello, world!").unwrap();
 
 		assert_eq!(
-			adapter
-				.read::<String>(Path::new("test_read.txt"))
-				.await
-				.unwrap(),
-			"Hello, world!"
+			adapter.read(Path::new("test_read.txt")).await.unwrap().data,
+			b"Hello, world!"
 		);
 
 		std::fs::remove_file("/tmp/flysystem_tests/test_read.txt").unwrap();

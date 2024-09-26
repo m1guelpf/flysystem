@@ -8,23 +8,26 @@ use aws_sdk_s3::{
 	Client,
 };
 use aws_types::region::Region;
-use mime::{FromStrError, Mime};
+use mime::Mime;
 use std::{
+	convert::Infallible,
+	io::{Error, ErrorKind, Result},
 	path::{Path, PathBuf},
 	str::FromStr,
 	time::{Duration, SystemTime},
 };
+use url::Url;
 
-use super::{Adapter, TemporaryUrlGenerator};
+use super::{Adapter, AdapterInit, TemporaryUrlGenerator};
 use crate::{contents::Contents, Visibility};
 
 #[derive(Debug, Clone, Default)]
 pub struct Config {
 	pub bucket: String,
+	pub region: String,
 	pub endpoint: String,
 	pub access_key: String,
 	pub secret_key: String,
-	pub region: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,11 +37,11 @@ pub struct S3Adapter {
 	bucket: String,
 }
 
-impl Adapter for S3Adapter {
-	type Error = Error;
+impl AdapterInit for S3Adapter {
+	type Error = Infallible;
 	type Config = Config;
 
-	async fn new(config: Self::Config) -> Result<Self, Self::Error> {
+	async fn new(config: Self::Config) -> std::result::Result<Self, Self::Error> {
 		let cred = Credentials::new(config.access_key, config.secret_key, None, None, "custom");
 
 		Ok(Self {
@@ -48,20 +51,23 @@ impl Adapter for S3Adapter {
 					.force_path_style(true)
 					.credentials_provider(cred)
 					.endpoint_url(config.endpoint)
-					.region(Region::new(
-						config.region.unwrap_or_else(|| "eu-central-1".to_string()),
-					))
+					.region(Region::new(config.region))
 					.build(),
 			),
 		})
 	}
+}
 
-	async fn file_exists(&self, path: &Path) -> Result<bool, Self::Error> {
+impl Adapter for S3Adapter {
+	async fn file_exists(&self, path: &Path) -> Result<bool> {
 		let request = self
 			.client
 			.head_object()
 			.bucket(&self.bucket)
-			.key(path.to_str().ok_or(Error::InvalidPath)?)
+			.key(
+				path.to_str()
+					.ok_or_else(|| Error::new(ErrorKind::InvalidData, "path is not valid utf-8"))?,
+			)
 			.send()
 			.await;
 
@@ -72,18 +78,24 @@ impl Adapter for S3Adapter {
 					return Ok(false);
 				}
 
-				Err(SdkError::ServiceError(error).into())
+				Err(Error::new(ErrorKind::Other, error.into_err()))
 			},
-			Err(e) => Err(e.into()),
+			Err(e) => Err(Error::new(ErrorKind::Other, e)),
 		}
 	}
 
-	async fn directory_exists(&self, path: &Path) -> Result<bool, Self::Error> {
+	async fn directory_exists(&self, path: &Path) -> Result<bool> {
 		let request = self
 			.client
 			.list_objects_v2()
 			.bucket(&self.bucket)
-			.prefix(format!("{}/", path.to_str().ok_or(Error::InvalidPath)?))
+			.prefix(format!(
+				"{}/",
+				path.to_str()
+					.ok_or_else(
+						|| Error::new(ErrorKind::InvalidData, "path is not valid utf-8",)
+					)?
+			))
 			.max_keys(1)
 			.delimiter('/')
 			.send()
@@ -96,23 +108,20 @@ impl Adapter for S3Adapter {
 					return Ok(false);
 				}
 
-				dbg!(error.err().meta().code());
-
-				Err(SdkError::ServiceError(error).into())
+				Err(Error::new(ErrorKind::Other, error.into_err()))
 			},
-			Err(e) => Err(e.into()),
+			Err(e) => Err(Error::new(ErrorKind::Other, e)),
 		}
 	}
 
-	async fn write<C: AsRef<[u8]> + Send>(
-		&mut self,
-		path: &Path,
-		content: C,
-	) -> Result<(), Self::Error> {
+	async fn write(&mut self, path: &Path, content: &[u8]) -> Result<()> {
 		self.client
 			.put_object()
 			.bucket(&self.bucket)
-			.key(path.to_str().ok_or(Error::InvalidPath)?)
+			.key(
+				path.to_str()
+					.ok_or_else(|| Error::new(ErrorKind::InvalidData, "path is not valid utf-8"))?,
+			)
 			.body(ByteStream::from(content.as_ref().to_vec()))
 			.content_type(
 				mime_guess::from_path(path)
@@ -120,38 +129,39 @@ impl Adapter for S3Adapter {
 					.to_string(),
 			)
 			.send()
-			.await?;
+			.await
+			.map_err(|e| Error::new(ErrorKind::Other, e))?;
 
 		Ok(())
 	}
 
-	async fn read<T: TryFrom<Contents>>(&self, path: &Path) -> Result<T, Self::Error> {
+	async fn read(&self, path: &Path) -> Result<Contents> {
 		let request = match self
 			.client
 			.get_object()
 			.bucket(&self.bucket)
-			.key(path.to_str().ok_or(Error::InvalidPath)?)
+			.key(
+				path.to_str()
+					.ok_or_else(|| Error::new(ErrorKind::InvalidData, "path is not valid utf-8"))?,
+			)
 			.send()
 			.await
 		{
 			Ok(request) => request,
 			Err(SdkError::ServiceError(error)) => {
 				if error.err().is_no_such_key() {
-					return Err(Error::FileNotFound);
+					return Err(Error::from(ErrorKind::NotFound));
 				}
 
-				return Err(SdkError::ServiceError(error).into());
+				return Err(Error::new(ErrorKind::Other, error.into_err()));
 			},
-			Err(e) => return Err(e.into()),
+			Err(e) => return Err(Error::new(ErrorKind::Other, e)),
 		};
 
-		Contents::from_bytestream(request.body)
-			.await?
-			.try_into()
-			.map_err(|_| Error::DecodeContents)
+		Ok(Contents::from_bytestream(request.body).await?)
 	}
 
-	async fn delete_directory(&mut self, path: &Path) -> Result<(), Self::Error> {
+	async fn delete_directory(&mut self, path: &Path) -> Result<()> {
 		let matching_files = self.list_contents(path, true).await?;
 
 		self.client
@@ -174,19 +184,27 @@ impl Adapter for S3Adapter {
 					.unwrap(),
 			)
 			.send()
-			.await?;
+			.await
+			.map_err(|e| Error::new(ErrorKind::Other, e))?;
 
 		Ok(())
 	}
 
-	async fn create_directory(&mut self, path: &Path) -> Result<(), Self::Error> {
+	async fn create_directory(&mut self, path: &Path) -> Result<()> {
 		self.client
 			.put_object()
 			.bucket(&self.bucket)
-			.key(format!("{}/", path.to_str().ok_or(Error::InvalidPath)?))
+			.key(format!(
+				"{}/",
+				path.to_str()
+					.ok_or_else(
+						|| Error::new(ErrorKind::InvalidData, "path is not valid utf-8",)
+					)?
+			))
 			.body(ByteStream::default())
 			.send()
-			.await?;
+			.await
+			.map_err(|e| Error::new(ErrorKind::Other, e))?;
 
 		Ok(())
 	}
@@ -194,16 +212,15 @@ impl Adapter for S3Adapter {
 	/// Set the visibility of a file.
 	///
 	/// Note that some S3 providers (like Minio) don't implement this feature.
-	async fn set_visibility(
-		&mut self,
-		path: &Path,
-		visibility: Visibility,
-	) -> Result<(), Self::Error> {
+	async fn set_visibility(&mut self, path: &Path, visibility: Visibility) -> Result<()> {
 		let response = self
 			.client
 			.put_object_acl()
 			.bucket(&self.bucket)
-			.key(path.to_str().ok_or(Error::InvalidPath)?)
+			.key(
+				path.to_str()
+					.ok_or_else(|| Error::new(ErrorKind::InvalidData, "path is not valid utf-8"))?,
+			)
 			.acl(visibility.into())
 			.send()
 			.await;
@@ -212,21 +229,24 @@ impl Adapter for S3Adapter {
 			Ok(_) => Ok(()),
 			Err(SdkError::ServiceError(error)) => {
 				if error.err().is_no_such_key() {
-					return Err(Error::FileNotFound);
+					return Err(Error::from(ErrorKind::NotFound));
 				}
 
-				Err(SdkError::ServiceError(error).into())
+				Err(Error::new(ErrorKind::Other, error.into_err()))
 			},
-			Err(e) => Err(e.into()),
+			Err(e) => Err(Error::new(ErrorKind::Other, e)),
 		}
 	}
 
-	async fn visibility(&self, path: &Path) -> Result<Visibility, Self::Error> {
+	async fn visibility(&self, path: &Path) -> Result<Visibility> {
 		let response = self
 			.client
 			.get_object_acl()
 			.bucket(&self.bucket)
-			.key(path.to_str().ok_or(Error::InvalidPath)?)
+			.key(
+				path.to_str()
+					.ok_or_else(|| Error::new(ErrorKind::InvalidData, "path is not valid utf-8"))?,
+			)
 			.send()
 			.await;
 
@@ -234,21 +254,24 @@ impl Adapter for S3Adapter {
 			Ok(response) => Ok(response.into()),
 			Err(SdkError::ServiceError(error)) => {
 				if error.err().is_no_such_key() {
-					return Err(Error::FileNotFound);
+					return Err(Error::from(ErrorKind::NotFound));
 				}
 
-				Err(SdkError::ServiceError(error).into())
+				Err(Error::new(ErrorKind::Other, error.into_err()))
 			},
-			Err(e) => Err(e.into()),
+			Err(e) => Err(Error::new(ErrorKind::Other, e)),
 		}
 	}
 
-	async fn mime_type(&self, path: &Path) -> Result<Mime, Self::Error> {
+	async fn mime_type(&self, path: &Path) -> Result<Mime> {
 		let response = self
 			.client
 			.head_object()
 			.bucket(&self.bucket)
-			.key(path.to_str().ok_or(Error::InvalidPath)?)
+			.key(
+				path.to_str()
+					.ok_or_else(|| Error::new(ErrorKind::InvalidData, "path is not valid utf-8"))?,
+			)
 			.send()
 			.await;
 
@@ -256,91 +279,113 @@ impl Adapter for S3Adapter {
 			Ok(response) => Ok(response
 				.content_type()
 				.map(Mime::from_str)
-				.ok_or(Error::FileNotFound)??),
+				.ok_or_else(|| Error::from(ErrorKind::NotFound))?
+				.map_err(|e| Error::new(ErrorKind::Other, e))?),
 			Err(SdkError::ServiceError(error)) => {
 				if error.err().is_not_found() {
-					return Err(Error::FileNotFound);
+					return Err(Error::from(ErrorKind::NotFound));
 				}
 
-				Err(SdkError::ServiceError(error).into())
+				Err(Error::new(ErrorKind::Other, error.into_err()))
 			},
-			Err(e) => Err(e.into()),
+			Err(e) => Err(Error::new(ErrorKind::Other, e)),
 		}
 	}
 
-	async fn last_modified(&self, path: &Path) -> Result<SystemTime, Self::Error> {
+	async fn last_modified(&self, path: &Path) -> Result<SystemTime> {
 		let response = self
 			.client
 			.head_object()
 			.bucket(&self.bucket)
-			.key(path.to_str().ok_or(Error::InvalidPath)?)
+			.key(
+				path.to_str()
+					.ok_or_else(|| Error::new(ErrorKind::InvalidData, "path is not valid utf-8"))?,
+			)
 			.send()
 			.await;
 
 		match response {
-			Ok(response) => Ok(SystemTime::try_from(
-				response.last_modified.ok_or(Error::LastModifiedMissing)?,
-			)?),
+			Ok(response) => Ok(SystemTime::try_from(response.last_modified.ok_or_else(|| {
+				Error::new(
+					ErrorKind::Other,
+					"S3 did not return a Last-Modified header.",
+				)
+			})?)
+			.map_err(|e| Error::new(ErrorKind::Other, e))?),
 			Err(SdkError::ServiceError(error)) => {
 				if error.err().is_not_found() {
-					return Err(Error::FileNotFound);
+					return Err(Error::from(ErrorKind::NotFound));
 				}
 
-				Err(SdkError::ServiceError(error).into())
+				Err(Error::new(ErrorKind::Other, error.into_err()))
 			},
-			Err(e) => Err(e.into()),
+			Err(e) => Err(Error::new(ErrorKind::Other, e)),
 		}
 	}
 
-	async fn file_size(&self, path: &Path) -> Result<u64, Self::Error> {
+	async fn file_size(&self, path: &Path) -> Result<u64> {
 		let response = self
 			.client
 			.head_object()
 			.bucket(&self.bucket)
-			.key(path.to_str().ok_or(Error::InvalidPath)?)
+			.key(
+				path.to_str()
+					.ok_or_else(|| Error::new(ErrorKind::InvalidData, "path is not valid utf-8"))?,
+			)
 			.send()
 			.await;
 
 		match response {
 			#[allow(clippy::cast_sign_loss)]
-			Ok(response) => Ok(response.content_length.ok_or(Error::FileNotFound)? as u64),
+			Ok(response) => Ok(response.content_length.ok_or_else(|| {
+				Error::new(
+					ErrorKind::Other,
+					"S3 did not return a Content-Length header",
+				)
+			})? as u64),
 			Err(SdkError::ServiceError(error)) => {
 				if error.err().is_not_found() {
-					return Err(Error::FileNotFound);
+					return Err(Error::from(ErrorKind::NotFound));
 				}
 
-				Err(SdkError::ServiceError(error).into())
+				Err(Error::new(ErrorKind::Other, error.into_err()))
 			},
-			Err(e) => Err(e.into()),
+			Err(e) => Err(Error::new(ErrorKind::Other, e)),
 		}
 	}
 
 	/// Delete a file from the filesystem.
 	///
 	/// Note that some S3 providers will return a success response even if the file does not exist.
-	async fn delete(&mut self, path: &Path) -> Result<(), Self::Error> {
+	async fn delete(&mut self, path: &Path) -> Result<()> {
 		self.client
 			.delete_object()
 			.bucket(&self.bucket)
-			.key(path.to_str().ok_or(Error::InvalidPath)?)
+			.key(
+				path.to_str()
+					.ok_or_else(|| Error::new(ErrorKind::InvalidData, "path is not valid utf-8"))?,
+			)
 			.send()
-			.await?;
+			.await
+			.map_err(|e| Error::new(ErrorKind::Other, e))?;
 
 		Ok(())
 	}
 
-	async fn list_contents(
-		&self,
-		path: &Path,
-		deep: bool,
-	) -> Result<Vec<std::path::PathBuf>, Self::Error> {
+	async fn list_contents(&self, path: &Path, deep: bool) -> Result<Vec<std::path::PathBuf>> {
 		let mut paths = Vec::new();
 
 		let mut request = self
 			.client
 			.list_objects_v2()
 			.bucket(&self.bucket)
-			.prefix(format!("{}/", path.to_str().ok_or(Error::InvalidPath)?));
+			.prefix(format!(
+				"{}/",
+				path.to_str()
+					.ok_or_else(
+						|| Error::new(ErrorKind::InvalidData, "path is not valid utf-8",)
+					)?
+			));
 
 		if !deep {
 			request = request.delimiter('/');
@@ -356,9 +401,9 @@ impl Adapter for S3Adapter {
 						continue;
 					}
 
-					return Err(SdkError::ServiceError(error).into());
+					return Err(Error::new(ErrorKind::Other, error.into_err()));
 				},
-				Err(e) => return Err(e.into()),
+				Err(e) => return Err(Error::new(ErrorKind::Other, e)),
 			};
 
 			paths.extend(
@@ -372,89 +417,104 @@ impl Adapter for S3Adapter {
 		Ok(paths)
 	}
 
-	async fn r#move(&mut self, source: &Path, destination: &Path) -> Result<(), Self::Error> {
+	async fn r#move(&mut self, source: &Path, destination: &Path) -> Result<()> {
 		self.copy(source, destination).await?;
 		self.delete(source).await?;
 
 		Ok(())
 	}
 
-	async fn copy(&mut self, source: &Path, destination: &Path) -> Result<(), Self::Error> {
-		let request = self
-			.client
-			.copy_object()
-			.copy_source(format!(
-				"{}/{}",
-				self.bucket,
-				source.to_str().ok_or(Error::InvalidPath)?
-			))
-			.bucket(&self.bucket)
-			.key(destination.to_str().ok_or(Error::InvalidPath)?)
-			.send()
-			.await;
+	async fn copy(&mut self, source: &Path, destination: &Path) -> Result<()> {
+		let request =
+			self.client
+				.copy_object()
+				.copy_source(format!(
+					"{}/{}",
+					self.bucket,
+					source.to_str().ok_or_else(|| Error::new(
+						ErrorKind::InvalidData,
+						"path is not valid utf-8",
+					))?
+				))
+				.bucket(&self.bucket)
+				.key(
+					destination.to_str().ok_or_else(|| {
+						Error::new(ErrorKind::InvalidData, "path is not valid utf-8")
+					})?,
+				)
+				.send()
+				.await;
 
 		match request {
 			Ok(_) => Ok(()),
 			Err(SdkError::ServiceError(error)) => {
 				if error.err().meta().code() == Some("NoSuchKey") {
-					return Err(Error::FileNotFound);
+					return Err(Error::from(ErrorKind::NotFound));
 				}
 
-				Err(SdkError::ServiceError(error).into())
+				Err(Error::new(ErrorKind::Other, error.into_err()))
 			},
-			Err(e) => Err(e.into()),
+			Err(e) => Err(Error::new(ErrorKind::Other, e)),
 		}
 	}
 
-	async fn checksum(&self, path: &Path) -> Result<String, Self::Error> {
+	async fn checksum(&self, path: &Path) -> Result<String> {
 		let request = self
 			.client
 			.head_object()
 			.bucket(&self.bucket)
-			.key(path.to_str().ok_or(Error::InvalidPath)?)
+			.key(
+				path.to_str()
+					.ok_or_else(|| Error::new(ErrorKind::InvalidData, "path is not valid utf-8"))?,
+			)
 			.send()
 			.await;
 
 		match request {
-			Ok(request) => request.e_tag.ok_or(Error::ETagMissing),
+			Ok(request) => request
+				.e_tag
+				.ok_or_else(|| Error::new(ErrorKind::Other, "S3 did not return an ETag header")),
 			Err(SdkError::ServiceError(error)) => {
 				if error.err().is_not_found() {
-					return Err(Error::FileNotFound);
+					return Err(Error::from(ErrorKind::NotFound));
 				}
 
-				Err(SdkError::ServiceError(error).into())
+				Err(Error::new(ErrorKind::Other, error.into_err()))
 			},
-			Err(e) => Err(e.into()),
+			Err(e) => Err(Error::new(ErrorKind::Other, e)),
 		}
 	}
 }
 
 impl TemporaryUrlGenerator for S3Adapter {
-	type Error = Error;
-
-	async fn temporary_url(
-		&self,
-		path: &Path,
-		expires_in: Duration,
-	) -> Result<String, Self::Error> {
+	async fn temporary_url(&self, path: &Path, expires_in: Duration) -> Result<Url> {
 		let request = self
 			.client
 			.get_object()
 			.bucket(&self.bucket)
-			.key(path.to_str().ok_or(Error::InvalidPath)?)
-			.presigned(PresigningConfig::expires_in(expires_in)?)
+			.key(
+				path.to_str()
+					.ok_or_else(|| Error::new(ErrorKind::InvalidData, "path is not valid utf-8"))?,
+			)
+			.presigned(
+				PresigningConfig::expires_in(expires_in)
+					.map_err(|e| Error::new(ErrorKind::InvalidInput, e))?,
+			)
 			.await;
 
 		match request {
-			Ok(presigned_req) => Ok(presigned_req.uri().to_string()),
+			Ok(presigned_req) => Ok(presigned_req
+				.uri()
+				.parse()
+				.map_err(|e| Error::new(ErrorKind::Other, e))?),
 			Err(SdkError::ServiceError(error)) => {
 				if error.err().is_no_such_key() {
-					return Err(Error::FileNotFound);
+					return Err(Error::from(ErrorKind::NotFound));
 				}
 
-				Err(SdkError::ServiceError(error).into())
+				Err(Error::new(ErrorKind::Other, error.into_err()))
 			},
-			Err(e) => Err(e.into()),
+			Err(e) => Err(Error::new(ErrorKind::Other, e)),
 		}
 	}
 }
@@ -474,13 +534,9 @@ impl From<GetObjectAclOutput> for Visibility {
 			let affects_all_users = grant
 				.grantee()
 				.and_then(|grantee| grantee.uri())
-				.map(|uri| uri == "http://acs.amazonaws.com/groups/global/AllUsers")
-				.unwrap_or_default();
+				.is_some_and(|uri| uri == "http://acs.amazonaws.com/groups/global/AllUsers");
 
-			let can_read = grant
-				.permission()
-				.map(|p| p == &Permission::Read)
-				.unwrap_or_default();
+			let can_read = grant.permission().is_some_and(|p| p == &Permission::Read);
 
 			if affects_all_users && can_read {
 				return Self::Public;
@@ -491,68 +547,6 @@ impl From<GetObjectAclOutput> for Visibility {
 	}
 }
 
-type ApiError<T> = aws_smithy_runtime_api::client::result::SdkError<
-	T,
-	aws_smithy_runtime_api::client::orchestrator::HttpResponse,
->;
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-	#[error("S3 did not return an ETag header")]
-	ETagMissing,
-
-	#[error("S3 did not return a Last-Modified header")]
-	LastModifiedMissing,
-
-	#[error("The requested file does not exist")]
-	FileNotFound,
-
-	#[error("Unable to get file details: {0}")]
-	HeadObject(#[from] ApiError<aws_sdk_s3::operation::head_object::HeadObjectError>),
-
-	#[error("Unable to list files in directory: {0}")]
-	ListObjects(#[from] ApiError<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error>),
-
-	#[error("Failed to parse: {0}")]
-	Parse(#[from] FromStrError),
-
-	#[error("Unable to upload file: {0}")]
-	PutObject(#[from] ApiError<aws_sdk_s3::operation::put_object::PutObjectError>),
-
-	#[error("Unable to download file: {0}")]
-	GetObject(#[from] ApiError<aws_sdk_s3::operation::get_object::GetObjectError>),
-
-	#[error("Unable to update visibility: {0}")]
-	PutObjectACL(#[from] ApiError<aws_sdk_s3::operation::put_object_acl::PutObjectAclError>),
-
-	#[error("Unable to read visibility: {0}")]
-	GetObjectACL(#[from] ApiError<aws_sdk_s3::operation::get_object_acl::GetObjectAclError>),
-
-	#[error("Unable to copy file: {0}")]
-	CopyObject(#[from] ApiError<aws_sdk_s3::operation::copy_object::CopyObjectError>),
-
-	#[error("Unable to delete file: {0}")]
-	DeleteObject(#[from] ApiError<aws_sdk_s3::operation::delete_object::DeleteObjectError>),
-
-	#[error("Unable to delete directory: {0}")]
-	DeleteObjects(#[from] ApiError<aws_sdk_s3::operation::delete_objects::DeleteObjectsError>),
-
-	#[error("The provided path contains invalid characters")]
-	InvalidPath,
-
-	#[error("Failed to load file contents: {0}")]
-	AllocateBuffer(#[from] aws_smithy_types::byte_stream::error::Error),
-
-	#[error("Failed to decode file contents")]
-	DecodeContents,
-
-	#[error("Failed to decode updated time: {0}")]
-	ConversionError(#[from] aws_smithy_types::date_time::ConversionError),
-
-	#[error("Failed to generate temporary URL: {0}")]
-	PresigningError(#[from] aws_sdk_s3::presigning::PresigningConfigError),
-}
-
 #[cfg(test)]
 mod tests {
 	use std::env;
@@ -561,8 +555,8 @@ mod tests {
 
 	async fn get_client() -> S3Adapter {
 		S3Adapter::new(Config {
-			region: env::var("S3_REGION").ok(),
 			bucket: env::var("S3_BUCKET").unwrap(),
+			region: env::var("S3_REGION").unwrap(),
 			endpoint: env::var("S3_ENDPOINT").unwrap(),
 			access_key: env::var("S3_ACCESS_KEY").unwrap(),
 			secret_key: env::var("S3_SECRET_KEY").unwrap(),
@@ -581,7 +575,7 @@ mod tests {
 			.unwrap());
 
 		client
-			.write(Path::new("test_file_exists.txt"), "Hello, world!")
+			.write(Path::new("test_file_exists.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
@@ -631,16 +625,13 @@ mod tests {
 			.unwrap());
 
 		client
-			.write(Path::new("test_write.txt"), "Hello, world!")
+			.write(Path::new("test_write.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
 		assert_eq!(
-			client
-				.read::<String>(Path::new("test_write.txt"))
-				.await
-				.unwrap(),
-			"Hello, world!"
+			client.read(Path::new("test_write.txt")).await.unwrap().data,
+			b"Hello, world!"
 		);
 
 		client.delete(Path::new("test_write.txt")).await.unwrap();
@@ -651,16 +642,13 @@ mod tests {
 		let mut client = get_client().await;
 
 		client
-			.write(Path::new("test_read.txt"), "Hello, world!")
+			.write(Path::new("test_read.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
 		assert_eq!(
-			client
-				.read::<String>(Path::new("test_read.txt"))
-				.await
-				.unwrap(),
-			"Hello, world!"
+			client.read(Path::new("test_read.txt")).await.unwrap().data,
+			b"Hello, world!"
 		);
 
 		client.delete(Path::new("test_read.txt")).await.unwrap();
@@ -671,7 +659,7 @@ mod tests {
 		let mut client = get_client().await;
 
 		client
-			.write(Path::new("test_delete.txt"), "Hello, world!")
+			.write(Path::new("test_delete.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
@@ -764,7 +752,7 @@ mod tests {
 		let mut client = get_client().await;
 
 		client
-			.write(Path::new("test_set_visibility.txt"), "")
+			.write(Path::new("test_set_visibility.txt"), &[])
 			.await
 			.unwrap();
 
@@ -801,7 +789,7 @@ mod tests {
 		let mut client = get_client().await;
 
 		client
-			.write(Path::new("test_visibility.txt"), "")
+			.write(Path::new("test_visibility.txt"), &[])
 			.await
 			.unwrap();
 
@@ -837,7 +825,7 @@ mod tests {
 		let mut client = get_client().await;
 
 		client
-			.write(Path::new("test_mime.txt"), "Hello, world!")
+			.write(Path::new("test_mime.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
@@ -854,7 +842,7 @@ mod tests {
 		let mut client = get_client().await;
 
 		client
-			.write(Path::new("test_last_modified.txt"), "")
+			.write(Path::new("test_last_modified.txt"), &[])
 			.await
 			.unwrap();
 
@@ -881,7 +869,7 @@ mod tests {
 		let mut client = get_client().await;
 
 		client
-			.write(Path::new("test_file_size.txt"), "Hello, world!")
+			.write(Path::new("test_file_size.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
@@ -906,14 +894,14 @@ mod tests {
 		client
 			.write(
 				Path::new("test_list_contents/test_file.txt"),
-				"Hello, world!",
+				b"Hello, world!",
 			)
 			.await
 			.unwrap();
 		client
 			.write(
 				Path::new("test_list_contents/test_recursive_dir/test_file.txt"),
-				"Hello, world!",
+				b"Hello, world!",
 			)
 			.await
 			.unwrap();
@@ -947,7 +935,7 @@ mod tests {
 		let mut client = get_client().await;
 
 		client
-			.write(Path::new("test_move.txt"), "Hello, world!")
+			.write(Path::new("test_move.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 
@@ -984,7 +972,7 @@ mod tests {
 		let mut client = get_client().await;
 
 		client
-			.write(Path::new("test_copy.txt"), "Hello, world!")
+			.write(Path::new("test_copy.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 		assert!(!client
@@ -1021,7 +1009,7 @@ mod tests {
 		let mut client = get_client().await;
 
 		client
-			.write(Path::new("test_checksum.txt"), "Hello, world!")
+			.write(Path::new("test_checksum.txt"), b"Hello, world!")
 			.await
 			.unwrap();
 

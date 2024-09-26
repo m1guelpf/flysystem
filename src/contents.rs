@@ -1,5 +1,7 @@
+use std::ops::Deref;
+
 pub struct Contents {
-	data: Vec<u8>,
+	pub data: Vec<u8>,
 }
 
 impl Contents {
@@ -10,6 +12,14 @@ impl Contents {
 		Ok(Self {
 			data: bytes.collect().await?.to_vec(),
 		})
+	}
+}
+
+impl Deref for Contents {
+	type Target = Vec<u8>;
+
+	fn deref(&self) -> &Self::Target {
+		&self.data
 	}
 }
 
